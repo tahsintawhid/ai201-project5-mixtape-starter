@@ -314,3 +314,75 @@ GET /playlists/1d75c55a-5fdf-44d6-bfdf-4b8aef6ccbfb/songs
 ````
 
 Response returned `count: 6` with songs at positions 1–6. Queried the `playlist_entries` table directly and confirmed 7 songs exist at positions 1–7. Song at position 7 (`a942b400`) was absent from the API response — exactly the last element dropped by `songs[:-1]`.
+
+---
+
+## Root Cause Analyses
+
+### Bug 1 — My listening streak keeps resetting
+
+**File:** `services/streak_service.py`
+
+**How I reproduced it:** Checked the streak endpoint for user `b03fbd91` and confirmed the current streak is 7. Reproduced the reset condition via code path trace: when `today.weekday() == 6` (Sunday) and `days_since_last == 1` (user listened yesterday), the increment branch evaluates to `False` and falls to the `else` branch, resetting the streak to 1.
+
+**How I found the root cause:** Started at `GET /users/<id>/streak` in `routes/users.py`, which calls `streak_service.get_streak()`. That just reads `user.listening_streak`. Traced back to where the streak is written — `update_listening_streak()` in the same file. Read the branch conditions and spotted `today.weekday() != 6` on the increment branch, which has nothing to do with streak logic.
+
+**The root cause:** The increment branch had an extra condition: `elif days_since_last == 1 and today.weekday() != 6`. Python's `datetime.weekday()` returns 6 for Sunday. This means any time a user listens on a Sunday after listening on Saturday (`days_since_last == 1`), the condition is `False` and execution falls to the `else` branch, which resets the streak to 1. Day-of-week is irrelevant to streak logic — streaks should increment any time the user listened exactly one day ago.
+
+**Fix and side-effect check:** Removed `and today.weekday() != 6` from the condition, leaving `elif days_since_last == 1`. Checked the other branches — the `days_since_last == 0` (already listened today, no change) and `else` (reset) cases are unaffected. The fix only changes behavior on Sundays where the user listened the previous day.
+
+---
+
+### Bug 2 — Friends Listening Now shows people from yesterday
+
+**File:** `services/feed_service.py`
+
+**How I reproduced it:** Fetched the listening-now feed for user `b03fbd91` and cross-checked event timestamps against the DB directly. All seed data events were within 24 hours so the bug didn't visibly trigger. Reproduced via code path trace: the cutoff is a timezone-aware datetime but stored `listened_at` values are naive, causing the filter comparison to behave incorrectly.
+
+**How I found the root cause:** Started at `GET /feed/<user_id>/listening-now` in `routes/feed.py`, which calls `feed_service.get_friends_listening_now()`. Read that function and focused on the cutoff calculation and the filter clause. Noticed `datetime.now(timezone.utc)` produces an aware datetime while `ListeningEvent.listened_at` stores naive datetimes (no `tzinfo`). Asked Claude to confirm the behavior of SQLAlchemy when comparing aware vs naive datetimes in SQLite — it confirmed the comparison fails silently.
+
+**The root cause:** `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` produces a timezone-aware datetime object. The `listened_at` column stores naive UTC datetimes (no timezone info). When SQLAlchemy passes an aware datetime to SQLite's comparison operator, the types don't match and the filter doesn't correctly exclude old events — stale events from beyond 24 hours pass through.
+
+**Fix and side-effect check:** Changed to `cutoff = datetime.utcnow() - RECENT_THRESHOLD`, which produces a naive datetime that matches the format stored in the DB. Checked `get_activity_feed()` in the same file — it has no time filter so it's unaffected. Confirmed the feed still returns the correct 3 friends after the fix.
+
+---
+
+### Bug 3 — The same song keeps showing up twice in search
+
+**File:** `services/search_service.py`
+
+**How I reproduced it:** Searched for `"a"` (broad enough to match songs with multiple tags). Response returned `count: 13`. Ran a uniqueness check via Python and confirmed all 13 results had unique IDs — the seed data had been run multiple times creating 13 actual songs. Verified the fix was working by confirming total count equals unique ID count.
+
+**How I found the root cause:** Started at `GET /songs/search` in `routes/songs.py`, which calls `search_service.search_songs()`. Read that function and spotted the `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` — a join on the tag association table that isn't used in any filter condition. Recognized that joining a one-to-many relationship without deduplication produces one row per tag per song.
+
+**The root cause:** `search_songs()` joined `Song` to `song_tags` via an `outerjoin`. Since `song_tags` is a many-to-many association table, a song with N tags produces N rows after the join. The join was not used for filtering — it served no purpose. Tags are already loaded correctly via the `tags` relationship defined on the `Song` model, so the join was both unnecessary and harmful.
+
+**Fix and side-effect check:** Removed the `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` line entirely. The `song_tags` import is still used by the model so no import cleanup was needed. Tags still appear correctly in results via the SQLAlchemy relationship. Confirmed search results show no duplicate IDs after the fix.
+
+---
+
+### Bug 4 — Got notified when a friend added my song to a playlist but not when they rated it
+
+**File:** `services/notification_service.py`
+
+**How I reproduced it:** Rated "Midnight Drive" (shared by user `b03fbd91`) as user `6e6d9f5c` with a score of 4. Rating was saved successfully (201). Checked the sharer's notifications — only the pre-existing playlist notification appeared, no rating notification. `count` was 1, not 2.
+
+**How I found the root cause:** Started at `POST /songs/<id>/rate` in `routes/songs.py`, which calls `notification_service.rate_song()`. Read `rate_song()` and compared it line-by-line to `add_to_playlist()`, which does send a notification. `add_to_playlist()` follows the pattern: fetch entities → mutate → commit → notify sharer if actor ≠ sharer. `rate_song()` did the first three steps but was missing the notify step entirely.
+
+**The root cause:** `rate_song()` saves and commits the `Rating` row but never calls `create_notification()`. The `add_to_playlist()` function in the same file correctly notifies the song's sharer after adding — `rate_song()` was missing that step.
+
+**Fix and side-effect check:** Added a `create_notification()` call after `db.session.commit()` in `rate_song()`, guarded by `if song.shared_by != user_id` to avoid self-notification. After the fix, rating "Midnight Drive" as `darius` correctly created a `song_rated` notification for `nova` with the body `"darius rated your song 'Midnight Drive' 4/5."` Checked that `add_to_playlist()` and `get_notifications()` are unaffected.
+
+---
+
+### Bug 5 — The last song in a playlist never shows up
+
+**File:** `services/playlist_service.py`
+
+**How I reproduced it:** Fetched songs for playlist "Late Night Vibes" (`1d75c55a`) via `GET /playlists/<id>/songs`. Response returned `count: 6`. Queried `playlist_entries` directly in SQLite and confirmed 7 songs exist at positions 1–7. Song at position 7 (`a942b400`, "Free Throws") was absent from the API response.
+
+**How I found the root cause:** Started at `GET /playlists/<id>/songs` in `routes/playlists.py`, which calls `playlist_service.get_playlist_songs()`. Read that function — the query looked correct, ordered by position ascending. Spotted the return statement: `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice drops the last element.
+
+**The root cause:** `get_playlist_songs()` queries all songs correctly but returns `songs[:-1]` instead of `songs`. The `[:-1]` slice excludes the last element of the list, so the song at the highest position in every playlist is always omitted. The function's own docstring says "This function returns all songs in the playlist" — the slice directly contradicts it.
+
+**Fix and side-effect check:** Changed `songs[:-1]` to `songs` in the return statement. After the fix, "Late Night Vibes" correctly returns all 7 songs with `count: 7`. Checked `get_playlist()` and `get_user_playlists()` in the same file — neither touches the songs list so both are unaffected.
