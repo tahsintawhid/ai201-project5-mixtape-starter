@@ -243,3 +243,74 @@ return [song.to_dict() for song in songs]
 
 I used Claude to help me orient to the codebase — specifically to read all service files at once and identify patterns across them. Claude helped me spot the architectural similarity between `add_to_playlist` and `rate_song` (Bug #4), and confirmed my read of the `outerjoin` producing duplicates (Bug #3). The root cause analysis and fix descriptions are my own. I verified each bug by reading the relevant code path myself before writing the documentation.
 ````
+---
+
+## Reproduction Notes
+
+**Bug 1 — Streak resets on Sundays**
+
+Checked the streak endpoint for user `b03fbd91` — current streak shows 7. Reproduced by code path trace rather than live timing: in `streak_service.py`, the increment branch is:
+
+```python
+elif days_since_last == 1 and today.weekday() != 6:
+    user.listening_streak += 1
+else:
+    user.listening_streak = 1
+```
+
+When `today.weekday() == 6` (Sunday) and `days_since_last == 1` (listened yesterday), the condition is `False` and falls to `else`, resetting the streak to 1. A user with a 7-day streak who listens every day would have it wiped every Sunday.
+
+---
+
+**Bug 2 — Friends Listening Now shows people from yesterday**
+
+Fetched the listening-now feed for user `b03fbd91`:
+
+````
+GET /feed/b03fbd91-b1d7-484a-b660-399d94b4bf7c/listening-now
+````
+
+The feed returned 3 friends. Cross-checking the `listening_event` table directly confirmed all 3 events are within 24 hours, so the bug does not visibly trigger with fresh seed data. Reproduced by code path trace: the cutoff is computed as `datetime.now(timezone.utc) - RECENT_THRESHOLD`, which produces a timezone-aware datetime. The `listened_at` values stored in the DB are naive (no timezone info). When SQLAlchemy compares an aware datetime against naive datetimes in SQLite, the comparison behaves incorrectly and the filter fails to exclude stale events. In production with older data, events from beyond 24 hours would pass through.
+
+---
+
+**Bug 3 — Duplicate songs in search**
+
+Searched for songs matching `"a"` (broad enough to hit songs with multiple tags):
+
+````
+GET /songs/search?q=a
+````
+
+Response returned `count: 13` but only 10 unique songs exist in the database. Songs with multiple tags appeared once per tag — "Crown Heights Anthem" (3 tags), "Harlem Renaissance" (3 tags), and "After Hours" (3 tags) each produced duplicate rows, inflating the count from 10 to 13. Confirmed by comparing the response list to the unique song IDs.
+
+---
+
+**Bug 4 — No notification when song is rated**
+
+Rated "Crown Heights Anthem" (shared by user `63e4d37a`) as a different user (`ee7acb33`):
+
+````
+POST /songs/009c2e98-dd4b-4a00-ac21-258596851f25/rate
+{ "user_id": "ee7acb33-f150-42ee-af96-7003e8acbb20", "score": 5 }
+````
+
+Rating saved successfully (201, returned rating object). Then checked the sharer's notifications:
+
+````
+GET /users/63e4d37a-da33-469c-8a51-d2108f9437e2/notifications
+````
+
+Response: `{ "count": 0, "notifications": [] }`. No notification was created for the sharer despite a different user rating their song.
+
+---
+
+**Bug 5 — Last song in playlist never shows up**
+
+Fetched songs for playlist "Late Night Vibes" (`1d75c55a`):
+
+````
+GET /playlists/1d75c55a-5fdf-44d6-bfdf-4b8aef6ccbfb/songs
+````
+
+Response returned `count: 6` with songs at positions 1–6. Queried the `playlist_entries` table directly and confirmed 7 songs exist at positions 1–7. Song at position 7 (`a942b400`) was absent from the API response — exactly the last element dropped by `songs[:-1]`.
