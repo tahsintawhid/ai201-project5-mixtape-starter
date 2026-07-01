@@ -186,3 +186,7 @@ Fetched `GET /playlists/1d75c55a-5fdf-44d6-bfdf-4b8aef6ccbfb/songs` — returned
 **The root cause:** `get_playlist_songs()` queries all songs correctly but returns `songs[:-1]` instead of `songs`. The `[:-1]` slice excludes the last element, so the song at the highest position in every playlist is always omitted. The function's own docstring says "This function returns all songs in the playlist" — directly contradicting the slice.
 
 **Fix and side-effect check:** Changed `songs[:-1]` to `songs`. After the fix, "Late Night Vibes" correctly returns all 7 songs with `count: 7`. `get_playlist()` and `get_user_playlists()` are unaffected.
+
+---
+
+*Bug 1 side-effect addendum: After removing the Sunday guard, verified that the `days_since_last == 0` branch (user listens twice in one day) and the `else` reset branch (user skips a day) still behave correctly — neither branch references `weekday()` so neither is affected by the change.*
