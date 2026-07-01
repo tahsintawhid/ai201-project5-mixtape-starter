@@ -1,3 +1,20 @@
+## AI Usage
+
+I used Claude extensively throughout this project, primarily for codebase navigation and debugging support rather than code generation.
+
+**Codebase orientation (Milestone 1):** I gave Claude all five service files and models.py at once and asked it to identify the main responsibilities of each file and trace the data flow for the song rating feature. This gave me a starting mental model before I read anything in detail. I verified the data flow description myself by reading the route and service files — the trace was accurate.
+
+**Reproducing bugs (Milestone 2):** Claude helped me write the curl commands to hit each endpoint using real IDs from the seed data. When the DB was empty and then writing to the wrong path, Claude walked me through diagnosing where Flask was storing the SQLite file. I ran every command myself and pasted the actual output back.
+
+**Bug diagnosis (Milestone 3):** For each bug I read the relevant code first, formed a hypothesis, then used Claude to confirm or pressure-test my read. Specific examples:
+- For Bug 1, I spotted `today.weekday() != 6` myself and asked Claude to confirm what `weekday()` returns for Sunday (6) and whether that condition would cause a reset on Sunday — it confirmed my read.
+- For Bug 2, I identified the aware vs naive datetime mismatch myself and asked Claude to confirm how SQLAlchemy handles that comparison in SQLite — it confirmed the filter would behave incorrectly.
+- For Bug 3, I identified the `outerjoin` as the cause and asked Claude "what structural difference between these two query blocks would cause duplicates" — it confirmed the one-to-many join without deduplication explanation.
+- For Bugs 4 and 5, I found both root causes entirely by reading the code. Bug 4 was obvious once I compared `rate_song()` to `add_to_playlist()` side by side. Bug 5 was the `songs[:-1]` slice which I spotted immediately.
+
+**Documentation (Milestones 1–4):** Claude helped me write the submission.md entries based on the actual output I collected from running the app. All curl outputs, DB queries, and test results are real — I ran everything myself and provided the data.
+
+**Where AI was less useful:** Claude couldn't diagnose Bug 3 reliably until I had already identified the outerjoin as suspicious — asking "what's wrong with this search function" before I'd read it myself would have been guesswork. The debugging workflow that worked was always: read the code → form a hypothesis → use Claude to confirm or explain → verify by running the app.
 ````markdown
 # Project 5 Submission — Mixtape Bug Hunt
 
