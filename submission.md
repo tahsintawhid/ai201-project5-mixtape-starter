@@ -129,7 +129,7 @@ Fetched `GET /playlists/1d75c55a-5fdf-44d6-bfdf-4b8aef6ccbfb/songs` — returned
 
 **The root cause:** The increment branch had an extra condition: `elif days_since_last == 1 and today.weekday() != 6`. Python's `datetime.weekday()` returns 6 for Sunday. Any time a user listens on a Sunday after listening on Saturday (`days_since_last == 1`), the condition is `False` and execution falls to the `else` branch, resetting the streak to 1. Day-of-week is irrelevant to streak logic — streaks should increment any time the user listened exactly one day ago.
 
-**Fix and side-effect check:** Removed `and today.weekday() != 6` from the condition, leaving `elif days_since_last == 1`. The `days_since_last == 0` and `else` branches are unaffected. The fix only changes behavior on Sundays where the user listened the previous day.
+**Fix and side-effect check:** Removed `and today.weekday() != 6` from the condition, leaving `elif days_since_last == 1`. Verified that the `days_since_last == 0` branch (user listens twice in one day) and the `else` reset branch (user skips a day) still behave correctly — neither branch references `weekday()` so neither is affected by the change. The fix only changes behavior on Sundays where the user listened the previous day.
 
 ---
 
@@ -143,7 +143,7 @@ Fetched `GET /playlists/1d75c55a-5fdf-44d6-bfdf-4b8aef6ccbfb/songs` — returned
 
 **The root cause:** `cutoff = datetime.now(timezone.utc) - RECENT_THRESHOLD` produces a timezone-aware datetime. The `listened_at` column stores naive UTC datetimes. When SQLAlchemy passes an aware datetime to SQLite's comparison operator, the types don't match and the filter doesn't correctly exclude old events — stale events from beyond 24 hours pass through.
 
-**Fix and side-effect check:** Changed to `cutoff = datetime.utcnow() - RECENT_THRESHOLD`, producing a naive datetime that matches the DB format. Checked `get_activity_feed()` in the same file — it has no time filter so it's unaffected.
+**Fix and side-effect check:** Changed to `cutoff = datetime.utcnow() - RECENT_THRESHOLD`, producing a naive datetime that matches the DB format. Checked `get_activity_feed()` in the same file — it has no time filter so it's unaffected. The deduplication logic and friend ID filtering in `get_friends_listening_now()` are unaffected since only the cutoff value changed.
 
 ---
 
@@ -157,7 +157,7 @@ Fetched `GET /playlists/1d75c55a-5fdf-44d6-bfdf-4b8aef6ccbfb/songs` — returned
 
 **The root cause:** `search_songs()` joined `Song` to `song_tags` via an `outerjoin`. Since `song_tags` is a many-to-many association table, a song with N tags produces N rows after the join. The join served no purpose — tags are already loaded correctly via the `tags` relationship on `Song`.
 
-**Fix and side-effect check:** Removed the `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` line entirely. Tags still appear correctly in results via the SQLAlchemy relationship. Confirmed no duplicate IDs after the fix.
+**Fix and side-effect check:** Removed the `.outerjoin(song_tags, Song.id == song_tags.c.song_id)` line entirely. Tags still appear correctly in results via the SQLAlchemy relationship — confirmed by checking that multi-tag songs like "Crown Heights Anthem" still return their full tag list after the fix. Confirmed no duplicate IDs in results.
 
 ---
 
@@ -171,7 +171,7 @@ Fetched `GET /playlists/1d75c55a-5fdf-44d6-bfdf-4b8aef6ccbfb/songs` — returned
 
 **The root cause:** `rate_song()` saves and commits the `Rating` row but never calls `create_notification()`. The `add_to_playlist()` function in the same file correctly notifies the sharer — `rate_song()` was simply missing that step.
 
-**Fix and side-effect check:** Added a `create_notification()` call after `db.session.commit()` in `rate_song()`, guarded by `if song.shared_by != user_id`. After the fix, rating "Midnight Drive" as `darius` correctly created a `song_rated` notification for `nova`: `"darius rated your song 'Midnight Drive' 4/5."` Confirmed `add_to_playlist()` and `get_notifications()` are unaffected.
+**Fix and side-effect check:** Added a `create_notification()` call after `db.session.commit()` in `rate_song()`, guarded by `if song.shared_by != user_id` to avoid self-notification — following the same structural pattern as `add_to_playlist()`. After the fix, rating "Midnight Drive" as `darius` correctly created a `song_rated` notification for `nova`: `"darius rated your song 'Midnight Drive' 4/5."` The key insight from comparing the two functions: `add_to_playlist()` performs the action and sends the notification inside the same function, completing the full pattern of fetch → mutate → commit → notify. `rate_song()` needed to complete that same pattern. Confirmed `add_to_playlist()` and `get_notifications()` are unaffected by the change.
 
 ---
 
@@ -185,8 +185,16 @@ Fetched `GET /playlists/1d75c55a-5fdf-44d6-bfdf-4b8aef6ccbfb/songs` — returned
 
 **The root cause:** `get_playlist_songs()` queries all songs correctly but returns `songs[:-1]` instead of `songs`. The `[:-1]` slice excludes the last element, so the song at the highest position in every playlist is always omitted. The function's own docstring says "This function returns all songs in the playlist" — directly contradicting the slice.
 
-**Fix and side-effect check:** Changed `songs[:-1]` to `songs`. After the fix, "Late Night Vibes" correctly returns all 7 songs with `count: 7`. `get_playlist()` and `get_user_playlists()` are unaffected.
+**Fix and side-effect check:** Changed `songs[:-1]` to `songs`. After the fix, "Late Night Vibes" correctly returns all 7 songs with `count: 7`. Checked boundary inputs: `songs[:-1]` on an empty list returns `[]` and `songs` on an empty list also returns `[]`, so an empty playlist behaves correctly either way. For a single-song playlist, `songs[:-1]` would return `[]` (dropping the only song) while `songs` correctly returns the one song — confirming the fix is necessary even at the boundary. `get_playlist()` and `get_user_playlists()` are unaffected.
 
 ---
 
-*Bug 1 side-effect addendum: After removing the Sunday guard, verified that the `days_since_last == 0` branch (user listens twice in one day) and the `else` reset branch (user skips a day) still behave correctly — neither branch references `weekday()` so neither is affected by the change.*
+## Regression Test
+
+Added a regression test for Bug 5 in `tests/test_playlists.py`. Three tests cover the fix:
+
+- `test_playlist_returns_all_songs` — seeds a playlist with 5 songs and asserts all 5 are returned. This would have failed against the original `songs[:-1]` code, which returned only 4.
+- `test_playlist_returns_songs_in_order` — confirms songs are returned in position order, not just that the count is correct.
+- `test_empty_playlist_returns_empty_list` — confirms the boundary case: an empty playlist returns `[]` without error, which behaves the same before and after the fix.
+
+Run with: `pytest tests/test_playlists.py -v`
